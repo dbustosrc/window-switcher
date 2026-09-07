@@ -1,4 +1,10 @@
-use std::{collections::HashSet, fs, path::PathBuf, process::Command};
+use std::{
+    collections::HashSet,
+    fs,
+    path::PathBuf,
+    process::Command,
+    sync::atomic::{AtomicU8, Ordering},
+};
 
 use anyhow::{anyhow, Result};
 use indexmap::IndexMap;
@@ -12,6 +18,10 @@ pub const SWITCH_WINDOWS_HOTKEY_ID: u32 = 1;
 pub const SWITCH_APPS_HOTKEY_ID: u32 = 2;
 
 const DEFAULT_CONFIG: &str = include_str!("../window-switcher.ini");
+const SYSTEM_SETTING_UNKNOWN: u8 = 0;
+const SYSTEM_SETTING_CURRENT_DESKTOP: u8 = 1;
+const SYSTEM_SETTING_ALL_DESKTOPS: u8 = 2;
+static SYSTEM_SWITCHER_ONLY_CURRENT_DESKTOP: AtomicU8 = AtomicU8::new(SYSTEM_SETTING_UNKNOWN);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -44,7 +54,7 @@ impl Default for Config {
             switch_windows_blacklist: Default::default(),
             switch_windows_ignore_minimal: false,
             switch_windows_only_current_desktop: None,
-            switch_apps_enable: false,
+            switch_apps_enable: true,
             switch_apps_hotkey: vec![Hotkey::create(
                 SWITCH_APPS_HOTKEY_ID,
                 "switch apps",
@@ -175,7 +185,26 @@ impl Config {
     }
 
     fn system_switcher_only_current_desktop() -> bool {
-        let alt_tab_filter = RegKey::new_hkcu(
+        match SYSTEM_SWITCHER_ONLY_CURRENT_DESKTOP.load(Ordering::Relaxed) {
+            SYSTEM_SETTING_CURRENT_DESKTOP => return true,
+            SYSTEM_SETTING_ALL_DESKTOPS => return false,
+            _ => {}
+        }
+
+        let only_current_desktop = Self::read_system_switcher_only_current_desktop();
+        SYSTEM_SWITCHER_ONLY_CURRENT_DESKTOP.store(
+            if only_current_desktop {
+                SYSTEM_SETTING_CURRENT_DESKTOP
+            } else {
+                SYSTEM_SETTING_ALL_DESKTOPS
+            },
+            Ordering::Relaxed,
+        );
+        only_current_desktop
+    }
+
+    fn read_system_switcher_only_current_desktop() -> bool {
+        let alt_tab_filter = RegKey::new_hkcu_read(
             w!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"),
             w!("VirtualDesktopAltTabFilter"),
         )
@@ -183,6 +212,10 @@ impl Config {
         .unwrap_or(1);
 
         alt_tab_filter != 0
+    }
+
+    pub(crate) fn refresh_system_settings() {
+        SYSTEM_SWITCHER_ONLY_CURRENT_DESKTOP.store(SYSTEM_SETTING_UNKNOWN, Ordering::Relaxed);
     }
 }
 

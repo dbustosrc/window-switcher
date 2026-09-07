@@ -1,13 +1,25 @@
-use crate::utils::is_process_elevated;
+use crate::utils::{get_process_elevation_info, HandleWrapper};
 
 use anyhow::{anyhow, Result};
-use indexmap::IndexMap;
-use std::{ffi::c_void, mem::size_of, path::PathBuf};
+use parking_lot::Mutex;
+use std::{
+    collections::{HashMap, HashSet},
+    ffi::c_void,
+    mem::size_of,
+    path::PathBuf,
+    sync::LazyLock,
+    time::Instant,
+};
 use windows::core::{BOOL, PCWSTR, PWSTR};
 use windows::Win32::{
-    Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HWND, LPARAM, MAX_PATH, POINT, RECT},
+    Foundation::{
+        ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, FILETIME, HWND, LPARAM, MAX_PATH, POINT, RECT,
+        WAIT_TIMEOUT,
+    },
     Graphics::{
-        Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWM_CLOAKED_SHELL},
+        Dwm::{
+            DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DWM_CLOAKED_SHELL,
+        },
         Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST},
     },
     Storage::{
@@ -17,32 +29,62 @@ use windows::Win32::{
     System::{
         LibraryLoader::GetModuleFileNameW,
         Threading::{
-            OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-            PROCESS_QUERY_LIMITED_INFORMATION,
+            GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, WaitForSingleObject,
+            PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
         },
     },
     UI::{
-        Input::KeyboardAndMouse::{SendInput, INPUT, INPUT_MOUSE},
+        HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
+        Input::KeyboardAndMouse::{IsWindowEnabled, SendInput, INPUT, INPUT_MOUSE},
         Shell::PropertiesSystem::{IPropertyStore, SHGetPropertyStoreForWindow},
         WindowsAndMessaging::{
-            EnumWindows, GetCursorPos, GetForegroundWindow, GetWindow, GetWindowLongPtrW,
-            GetWindowPlacement, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-            SetForegroundWindow, ShowWindow, GWL_EXSTYLE, GWL_STYLE, GWL_USERDATA, GW_OWNER,
-            SW_RESTORE, WINDOWPLACEMENT, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_ICONIC, WS_VISIBLE,
+            EnumWindows, GetAncestor, GetCursorPos, GetForegroundWindow, GetWindow,
+            GetWindowLongPtrW, GetWindowPlacement, GetWindowRect, GetWindowTextW,
+            GetWindowThreadProcessId, IsIconic, IsWindow, SetForegroundWindow, ShowWindow,
+            GA_ROOTOWNER, GWL_EXSTYLE, GWL_STYLE, GWL_USERDATA, GW_ENABLEDPOPUP, GW_OWNER,
+            SW_RESTORE, WINDOWPLACEMENT, WS_EX_TOOLWINDOW, WS_ICONIC, WS_VISIBLE,
         },
     },
 };
 
-pub fn get_window_state(hwnd: HWND) -> (bool, bool, bool, bool) {
+const PROCESS_CACHE_LIMIT: usize = 128;
+const AUMID_CACHE_LIMIT: usize = 256;
+
+#[derive(Clone)]
+struct ProcessMetadata {
+    module_path: Option<String>,
+    elevated: Option<bool>,
+    creation_time: u64,
+}
+
+struct ProcessCacheEntry {
+    process: HandleWrapper,
+    metadata: ProcessMetadata,
+    last_used: Instant,
+}
+
+type WindowIdentity = (isize, u32, u64);
+pub type WindowList = Vec<(HWND, String)>;
+type OwnedWindows = HashMap<isize, HWND>;
+
+struct AumidCacheEntry {
+    value: Option<String>,
+    last_used: Instant,
+}
+
+static PROCESS_CACHE: LazyLock<Mutex<HashMap<u32, ProcessCacheEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static AUMID_CACHE: LazyLock<Mutex<HashMap<WindowIdentity, AumidCacheEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub fn get_window_state(hwnd: HWND) -> (bool, bool, bool) {
     let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32;
     let exstyle = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
 
     let is_visible = style & WS_VISIBLE.0 != 0;
     let is_iconic = style & WS_ICONIC.0 != 0;
     let is_tool = exstyle & WS_EX_TOOLWINDOW.0 != 0;
-    let is_topmost = exstyle & WS_EX_TOPMOST.0 != 0;
-
-    (is_visible, is_iconic, is_tool, is_topmost)
+    (is_visible, is_iconic, is_tool)
 }
 
 pub fn is_iconic_window(hwnd: HWND) -> bool {
@@ -76,11 +118,33 @@ fn is_cloaked_window(hwnd: HWND, only_current_desktop: bool) -> bool {
 }
 
 pub fn is_small_window(hwnd: HWND) -> bool {
-    let (width, height) = get_window_size(hwnd);
+    is_small_window_with_state(hwnd, is_iconic_window(hwnd))
+}
+
+fn is_small_window_with_state(hwnd: HWND, is_iconic: bool) -> bool {
+    if is_iconic {
+        return false;
+    }
+    let (width, height) = get_window_size_with_state(hwnd, false);
     width < 120 || height < 90
 }
 
-pub fn get_moinitor_rect() -> RECT {
+pub fn is_switchable_window(hwnd: HWND, ignore_minimal: bool, only_current_desktop: bool) -> bool {
+    let (is_visible, is_iconic, is_tool) = get_window_state(hwnd);
+    if !is_visible
+        || (ignore_minimal && is_iconic)
+        || is_tool
+        || is_cloaked_window(hwnd, only_current_desktop)
+        || is_small_window_with_state(hwnd, is_iconic)
+    {
+        return false;
+    }
+
+    let title = get_window_title(hwnd);
+    !title.is_empty() && title != "Windows Input Experience"
+}
+
+pub fn get_monitor_rect_and_dpi() -> (RECT, u32) {
     unsafe {
         let mut mi = MONITORINFO {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
@@ -91,15 +155,62 @@ pub fn get_moinitor_rect() -> RECT {
 
         let hmonitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
         let _ = GetMonitorInfoW(hmonitor, &mut mi);
-        mi.rcMonitor
+        let mut dpi_x = 96;
+        let mut dpi_y = 96;
+        let _ = GetDpiForMonitor(hmonitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
+        (mi.rcMonitor, dpi_x.max(96))
     }
 }
 
 pub fn get_window_size(hwnd: HWND) -> (i32, i32) {
+    get_window_size_with_state(hwnd, is_iconic_window(hwnd))
+}
+
+fn get_window_size_with_state(hwnd: HWND, is_iconic: bool) -> (i32, i32) {
+    if !is_iconic {
+        if let Some(size) = get_visual_window_size(hwnd) {
+            return size;
+        }
+    }
+
     let mut placement = WINDOWPLACEMENT::default();
-    let _ = unsafe { GetWindowPlacement(hwnd, &mut placement) };
-    let rect = placement.rcNormalPosition;
-    ((rect.right - rect.left), (rect.bottom - rect.top))
+    if unsafe { GetWindowPlacement(hwnd, &mut placement) }.is_ok() {
+        if let Some(size) = rect_size(placement.rcNormalPosition) {
+            return size;
+        }
+    }
+
+    get_visual_window_size(hwnd).unwrap_or_default()
+}
+
+fn get_visual_window_size(hwnd: HWND) -> Option<(i32, i32)> {
+    let mut rect = RECT::default();
+    if unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut rect as *mut RECT as *mut c_void,
+            size_of::<RECT>() as u32,
+        )
+    }
+    .is_ok()
+    {
+        if let Some(size) = rect_size(rect) {
+            return Some(size);
+        }
+    }
+
+    let mut rect = RECT::default();
+    if unsafe { GetWindowRect(hwnd, &mut rect) }.is_ok() {
+        return rect_size(rect);
+    }
+    None
+}
+
+fn rect_size(rect: RECT) -> Option<(i32, i32)> {
+    let width = rect.right.checked_sub(rect.left)?;
+    let height = rect.bottom.checked_sub(rect.top)?;
+    (width > 0 && height > 0).then_some((width, height))
 }
 
 pub fn get_exe_folder() -> Result<PathBuf> {
@@ -123,7 +234,10 @@ pub fn get_window_pid(hwnd: HWND) -> u32 {
 }
 
 pub fn get_module_path(pid: u32) -> Option<String> {
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    get_process_metadata(pid).module_path
+}
+
+fn get_module_path_from_handle(handle: windows::Win32::Foundation::HANDLE) -> Option<String> {
     let mut len: u32 = MAX_PATH;
     let mut name = vec![0u16; len as usize];
     let ret = unsafe {
@@ -145,20 +259,141 @@ pub fn get_module_path(pid: u32) -> Option<String> {
     Some(module_path)
 }
 
+fn get_process_module_path(pid: u32, is_admin: bool) -> Option<String> {
+    let metadata = get_process_metadata(pid);
+    if !is_admin && metadata.elevated == Some(true) {
+        return None;
+    }
+    metadata.module_path
+}
+
+fn get_process_metadata(pid: u32) -> ProcessMetadata {
+    if pid == 0 {
+        return ProcessMetadata {
+            module_path: None,
+            elevated: None,
+            creation_time: 0,
+        };
+    }
+
+    {
+        let mut cache = PROCESS_CACHE.lock();
+        if let Some(entry) = cache.get_mut(&pid) {
+            if unsafe { WaitForSingleObject(entry.process.get_handle(), 0) } == WAIT_TIMEOUT {
+                entry.last_used = Instant::now();
+                return entry.metadata.clone();
+            }
+            cache.remove(&pid);
+        }
+    }
+
+    let Some(process_handle) = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            false,
+            pid,
+        )
+    }
+    .ok() else {
+        return ProcessMetadata {
+            module_path: None,
+            elevated: None,
+            creation_time: 0,
+        };
+    };
+    let process = HandleWrapper::new(process_handle);
+    let metadata = ProcessMetadata {
+        module_path: get_module_path_from_handle(process.get_handle()),
+        elevated: get_process_elevation_info(process.get_handle()).ok(),
+        creation_time: get_process_creation_time(process.get_handle()),
+    };
+
+    let mut cache = PROCESS_CACHE.lock();
+    cache.retain(
+        |_, entry| unsafe { WaitForSingleObject(entry.process.get_handle(), 0) } == WAIT_TIMEOUT,
+    );
+    if cache.len() >= PROCESS_CACHE_LIMIT {
+        if let Some(oldest_pid) = cache
+            .iter()
+            .min_by_key(|(_, entry)| (entry.last_used, entry.metadata.creation_time))
+            .map(|(pid, _)| *pid)
+        {
+            cache.remove(&oldest_pid);
+        }
+    }
+    cache.insert(
+        pid,
+        ProcessCacheEntry {
+            process,
+            metadata: metadata.clone(),
+            last_used: Instant::now(),
+        },
+    );
+    metadata
+}
+
+fn get_process_creation_time(process: windows::Win32::Foundation::HANDLE) -> u64 {
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    if unsafe { GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user) }
+        .is_err()
+    {
+        return 0;
+    }
+    ((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64
+}
+
 fn is_chrome_browser(module_path: &str) -> bool {
-    let lower = module_path.to_lowercase();
-    lower.ends_with("chrome.exe")
+    PathBuf::from(module_path)
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("chrome.exe"))
 }
 
 fn is_edge_browser(module_path: &str) -> bool {
-    let lower = module_path.to_lowercase();
-    lower.ends_with("msedge.exe")
+    PathBuf::from(module_path)
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("msedge.exe"))
 }
 
 fn get_aumid(hwnd: HWND) -> Option<String> {
-    let store: IPropertyStore = unsafe { SHGetPropertyStoreForWindow(hwnd).ok()? };
-    let propvar = unsafe { store.GetValue(&PKEY_AppUserModel_ID).ok()? };
-    Some(propvar.to_string())
+    let pid = get_window_pid(hwnd);
+    let creation_time = get_process_metadata(pid).creation_time;
+    let key = (hwnd.0 as isize, pid, creation_time);
+    {
+        let mut cache = AUMID_CACHE.lock();
+        if let Some(entry) = cache.get_mut(&key) {
+            entry.last_used = Instant::now();
+            return entry.value.clone();
+        }
+    }
+
+    let aumid = unsafe {
+        SHGetPropertyStoreForWindow(hwnd)
+            .ok()
+            .and_then(|store: IPropertyStore| store.GetValue(&PKEY_AppUserModel_ID).ok())
+            .map(|propvar| propvar.to_string())
+    };
+
+    let mut cache = AUMID_CACHE.lock();
+    if cache.len() >= AUMID_CACHE_LIMIT {
+        if let Some(oldest_hwnd) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(hwnd, _)| *hwnd)
+        {
+            cache.remove(&oldest_hwnd);
+        }
+    }
+    cache.insert(
+        key,
+        AumidCacheEntry {
+            value: aumid.clone(),
+            last_used: Instant::now(),
+        },
+    );
+    aumid
 }
 
 fn get_edge_aumid_info(hwnd: HWND) -> (Option<String>, Option<String>) {
@@ -370,9 +605,12 @@ pub fn get_window_exe(hwnd: HWND) -> Option<String> {
     module_path.split('\\').map(|v| v.to_string()).next_back()
 }
 
-pub fn set_foreground_window(hwnd: HWND) {
+pub fn set_foreground_window(hwnd: HWND) -> bool {
     // ref https://github.com/microsoft/PowerToys/blob/4cb72ee126caf1f720c507f6a1dbe658cd515366/src/modules/fancyzones/FancyZonesLib/WindowUtils.cpp#L191
     unsafe {
+        if !IsWindow(Some(hwnd)).as_bool() {
+            return false;
+        }
         if is_iconic_window(hwnd) {
             let _ = ShowWindow(hwnd, SW_RESTORE);
         }
@@ -384,8 +622,8 @@ pub fn set_foreground_window(hwnd: HWND) {
 
         SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
 
-        let _ = SetForegroundWindow(hwnd);
-    };
+        SetForegroundWindow(hwnd).as_bool()
+    }
 }
 
 pub fn get_foreground_window() -> HWND {
@@ -401,8 +639,90 @@ pub fn get_window_title(hwnd: HWND) -> String {
     String::from_utf16_lossy(&buf[..len as usize])
 }
 
+fn get_selector_title(hwnd: HWND, modal: Option<HWND>) -> String {
+    if let Some(modal) = modal {
+        let modal_title = get_window_title(modal);
+        if !modal_title.is_empty() {
+            return modal_title;
+        }
+    }
+    get_window_title(hwnd)
+}
+
 pub fn get_owner_window(hwnd: HWND) -> HWND {
     unsafe { GetWindow(hwnd, GW_OWNER) }.unwrap_or_default()
+}
+
+fn get_root_owner_window(hwnd: HWND) -> HWND {
+    let root = unsafe { GetAncestor(hwnd, GA_ROOTOWNER) };
+    if root.is_invalid() {
+        hwnd
+    } else {
+        root
+    }
+}
+
+fn is_modal_popup_relation(
+    root: HWND,
+    popup: HWND,
+    root_enabled: bool,
+    popup_visible: bool,
+    popup_enabled: bool,
+    same_process: bool,
+    popup_root: HWND,
+) -> bool {
+    !root.is_invalid()
+        && !popup.is_invalid()
+        && root.0 != popup.0
+        && !root_enabled
+        && popup_visible
+        && popup_enabled
+        && same_process
+        && popup_root.0 == root.0
+}
+
+/// Returns the enabled popup that currently blocks the root window, if any.
+///
+/// `GW_ENABLEDPOPUP` is combined with the disabled-root check and root-owner/
+/// process validation. This collapses modal dialogs without grouping unrelated
+/// top-level windows that happen to belong to the same application.
+fn get_blocking_modal_popup_for_root(root: HWND) -> Option<HWND> {
+    if root.is_invalid() || unsafe { IsWindowEnabled(root) }.as_bool() {
+        return None;
+    }
+
+    let popup = unsafe { GetWindow(root, GW_ENABLEDPOPUP) }.unwrap_or_default();
+    if popup.is_invalid() || popup.0 == root.0 || !unsafe { IsWindow(Some(popup)) }.as_bool() {
+        return None;
+    }
+
+    let (popup_visible, _, _) = get_window_state(popup);
+    let popup_enabled = unsafe { IsWindowEnabled(popup) }.as_bool();
+    let root_pid = get_window_pid(root);
+    let same_process = root_pid != 0 && root_pid == get_window_pid(popup);
+    let popup_root = get_root_owner_window(popup);
+
+    is_modal_popup_relation(
+        root,
+        popup,
+        false,
+        popup_visible,
+        popup_enabled,
+        same_process,
+        popup_root,
+    )
+    .then_some(popup)
+}
+
+fn get_blocking_modal_popup(hwnd: HWND) -> Option<HWND> {
+    get_blocking_modal_popup_for_root(get_root_owner_window(hwnd))
+}
+
+/// Resolves a selector entry to the window that can actually receive input.
+/// A modal may have opened or closed since the selector list was built, so this
+/// is evaluated again immediately before activating the selection.
+pub fn get_activation_window(hwnd: HWND) -> HWND {
+    get_blocking_modal_popup(hwnd).unwrap_or(hwnd)
 }
 
 #[cfg(target_arch = "x86")]
@@ -425,75 +745,157 @@ pub fn set_window_user_data(hwnd: HWND, ptr: isize) -> isize {
     unsafe { windows::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW(hwnd, GWL_USERDATA, ptr) }
 }
 
-/// Lists available windows
-///
-/// Duo to the limitation of `OpenProcess`, this function will not list `Task Manager`
-/// and others which are running as administrator if `Switcher` is not `running as administrator`.
+/// Lists switchable windows that belong to the same logical application as `target`.
 pub fn list_windows(
+    target: HWND,
     ignore_minimal: bool,
     only_current_desktop: bool,
     is_admin: bool,
-) -> Result<IndexMap<String, Vec<(HWND, String)>>> {
-    let mut result: IndexMap<String, Vec<(HWND, String)>> = IndexMap::new();
+) -> Result<Option<(String, WindowList)>> {
+    let (windows, owned_windows) =
+        enumerate_window_candidates(ignore_minimal, only_current_desktop)?;
+    let mut module_paths = HashMap::new();
+    let Some(target_module) =
+        resolve_base_module_path(target, &owned_windows, &mut module_paths, is_admin)
+    else {
+        return Ok(None);
+    };
+    let target_key = build_module_key(target_module.clone(), target);
+    let mut result = Vec::new();
+    for (hwnd, title) in windows {
+        let Some(module_path) =
+            resolve_base_module_path(hwnd, &owned_windows, &mut module_paths, is_admin)
+        else {
+            continue;
+        };
+        if module_path != target_module {
+            continue;
+        }
+        if build_module_key(module_path, hwnd) == target_key {
+            result.push((hwnd, title));
+        }
+    }
+    debug!("list windows for {target:?}: {result:?}");
+    Ok(Some((target_key, result)))
+}
+
+/// Lists every available window in the global window order without grouping
+/// windows that belong to the same application.
+pub fn list_all_windows(
+    ignore_minimal: bool,
+    only_current_desktop: bool,
+    is_admin: bool,
+) -> Result<Vec<(String, HWND, String)>> {
+    let (windows, owned_windows) =
+        enumerate_window_candidates(ignore_minimal, only_current_desktop)?;
+    let mut result = Vec::with_capacity(windows.len());
+    let mut module_paths = HashMap::new();
+    for (hwnd, title) in windows {
+        let Some(module_path) =
+            resolve_base_module_path(hwnd, &owned_windows, &mut module_paths, is_admin)
+        else {
+            continue;
+        };
+        let key = build_module_key(module_path, hwnd);
+        result.push((key, hwnd, title));
+    }
+    debug!("list all windows {result:?}");
+    Ok(result)
+}
+
+fn enumerate_window_candidates(
+    ignore_minimal: bool,
+    only_current_desktop: bool,
+) -> Result<(WindowList, OwnedWindows)> {
     let mut hwnds: Vec<HWND> = Default::default();
     unsafe { EnumWindows(Some(enum_window), LPARAM(&mut hwnds as *mut _ as isize)) }
         .map_err(|e| anyhow!("Fail to get windows {}", e))?;
-    let mut valid_hwnds = vec![];
-    let mut owner_hwnds = vec![];
-    for hwnd in hwnds.iter().cloned() {
-        let (is_visible, is_iconic, is_tool, is_topmost) = get_window_state(hwnd);
+    let active_hwnds: HashSet<isize> = hwnds.iter().map(|hwnd| hwnd.0 as isize).collect();
+    AUMID_CACHE
+        .lock()
+        .retain(|(hwnd, _, _), _| active_hwnds.contains(hwnd));
+    let mut valid_hwnds = Vec::with_capacity(hwnds.len());
+    let mut seen_candidates = HashSet::with_capacity(hwnds.len());
+    let mut modal_popups = HashMap::new();
+    let mut owned_windows = OwnedWindows::new();
+    for hwnd in hwnds {
+        let (is_visible, is_iconic, is_tool) = get_window_state(hwnd);
         let ok = is_visible
             && (if ignore_minimal { !is_iconic } else { true })
             && !is_tool
-            && !is_topmost
             && !is_cloaked_window(hwnd, only_current_desktop)
-            && !is_small_window(hwnd);
+            && !is_small_window_with_state(hwnd, is_iconic);
         if ok {
-            let title = get_window_title(hwnd);
-            if !title.is_empty() && title != "Windows Input Experience" {
-                valid_hwnds.push((hwnd, title));
-            }
-        }
-        owner_hwnds.push(get_owner_window(hwnd))
-    }
-    for (hwnd, title) in valid_hwnds.into_iter() {
-        let mut pid = get_window_pid(hwnd);
-        let mut module_path = get_module_path(pid).unwrap_or_default();
-        if !is_valid_module_path(&module_path) {
-            if let Some((i, _)) = owner_hwnds.iter().enumerate().find(|(_, v)| **v == hwnd) {
-                pid = get_window_pid(hwnds[i]);
-                module_path = get_module_path(pid).unwrap_or_default();
-            }
-        }
-        if is_valid_module_path(&module_path) {
-            if !is_admin {
-                if let Some(true) = is_process_elevated(pid) {
-                    continue;
-                }
-            }
-            let key = if is_chrome_browser(&module_path) {
-                match get_chrome_aumid_info(hwnd) {
-                    (Some(profile), Some(app_id)) => {
-                        format!("{}::{}::{}", module_path, profile, app_id)
-                    }
-                    (Some(profile), None) => format!("{}::{}", module_path, profile),
-                    (None, Some(app_id)) => format!("{}::Default::{}", module_path, app_id),
-                    (None, None) => module_path.clone(),
-                }
-            } else if is_edge_browser(&module_path) {
-                match get_edge_aumid_info(hwnd) {
-                    (None, Some(pkg)) => format!("{}::appx::{}", module_path, pkg),
-                    (Some(profile), None) => format!("{}::{}", module_path, profile),
-                    _ => module_path.clone(),
+            let root = get_root_owner_window(hwnd);
+            let blocking_modal = *modal_popups
+                .entry(root.0 as isize)
+                .or_insert_with(|| get_blocking_modal_popup_for_root(root));
+            let (candidate, title_modal) = if let Some(modal) = blocking_modal {
+                if is_switchable_window(root, ignore_minimal, only_current_desktop) {
+                    (root, Some(modal))
+                } else {
+                    (hwnd, None)
                 }
             } else {
-                module_path.clone()
+                (hwnd, None)
             };
-            result.entry(key).or_default().push((hwnd, title));
+            if seen_candidates.insert(candidate.0 as isize) {
+                let title = get_selector_title(candidate, title_modal);
+                if !title.is_empty() && title != "Windows Input Experience" {
+                    valid_hwnds.push((candidate, title));
+                }
+            }
+        }
+        let owner = get_owner_window(hwnd);
+        if !owner.is_invalid() {
+            owned_windows.entry(owner.0 as isize).or_insert(hwnd);
         }
     }
-    debug!("list windows {result:?}");
-    Ok(result)
+    Ok((valid_hwnds, owned_windows))
+}
+
+fn resolve_base_module_path(
+    hwnd: HWND,
+    owned_windows: &HashMap<isize, HWND>,
+    module_paths: &mut HashMap<u32, Option<String>>,
+    is_admin: bool,
+) -> Option<String> {
+    let mut pid = get_window_pid(hwnd);
+    let mut module_path = module_paths
+        .entry(pid)
+        .or_insert_with(|| get_process_module_path(pid, is_admin))
+        .clone()
+        .unwrap_or_default();
+    if !is_valid_module_path(&module_path) {
+        if let Some(owned_window) = owned_windows.get(&(hwnd.0 as isize)) {
+            pid = get_window_pid(*owned_window);
+            module_path = module_paths
+                .entry(pid)
+                .or_insert_with(|| get_process_module_path(pid, is_admin))
+                .clone()
+                .unwrap_or_default();
+        }
+    }
+    is_valid_module_path(&module_path).then_some(module_path)
+}
+
+fn build_module_key(module_path: String, hwnd: HWND) -> String {
+    if is_chrome_browser(&module_path) {
+        match get_chrome_aumid_info(hwnd) {
+            (Some(profile), Some(app_id)) => format!("{module_path}::{profile}::{app_id}"),
+            (Some(profile), None) => format!("{module_path}::{profile}"),
+            (None, Some(app_id)) => format!("{module_path}::Default::{app_id}"),
+            (None, None) => module_path,
+        }
+    } else if is_edge_browser(&module_path) {
+        match get_edge_aumid_info(hwnd) {
+            (None, Some(pkg)) => format!("{module_path}::appx::{pkg}"),
+            (Some(profile), None) => format!("{module_path}::{profile}"),
+            _ => module_path,
+        }
+    } else {
+        module_path
+    }
 }
 
 fn is_valid_module_path(module_path: &str) -> bool {
@@ -504,4 +906,76 @@ extern "system" fn enum_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let windows: &mut Vec<HWND> = unsafe { &mut *(lparam.0 as *mut Vec<HWND>) };
     windows.push(hwnd);
     BOOL(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn browser_detection_is_case_insensitive_and_filename_scoped() {
+        assert!(is_chrome_browser(r"C:\Program Files\Google\Chrome.EXE"));
+        assert!(is_edge_browser(r"C:\Program Files\Edge\msedge.exe"));
+        assert!(!is_chrome_browser(r"C:\Tools\chrome.exe.helper"));
+        assert!(!is_edge_browser(r"C:\Tools\not-msedge.exe"));
+    }
+
+    #[test]
+    fn application_frame_host_is_not_a_final_module_path() {
+        assert!(!is_valid_module_path(
+            r"C:\Windows\System32\ApplicationFrameHost.exe"
+        ));
+        assert!(is_valid_module_path(r"C:\Windows\System32\notepad.exe"));
+        assert!(!is_valid_module_path(""));
+    }
+
+    #[test]
+    fn rect_size_accepts_only_positive_dimensions() {
+        assert_eq!(
+            rect_size(RECT {
+                left: -10,
+                top: 20,
+                right: 190,
+                bottom: 120,
+            }),
+            Some((200, 100))
+        );
+        assert_eq!(rect_size(RECT::default()), None);
+        assert_eq!(
+            rect_size(RECT {
+                left: 10,
+                top: 10,
+                right: 5,
+                bottom: 20,
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn small_window_filter_keeps_minimized_windows() {
+        assert!(!is_small_window_with_state(HWND::default(), true));
+    }
+
+    #[test]
+    fn modal_popup_requires_a_disabled_root_and_matching_ownership() {
+        let root = HWND(1 as _);
+        let popup = HWND(2 as _);
+
+        assert!(is_modal_popup_relation(
+            root, popup, false, true, true, true, root
+        ));
+        assert!(!is_modal_popup_relation(
+            root, popup, true, true, true, true, root
+        ));
+        assert!(!is_modal_popup_relation(
+            root, popup, false, true, true, false, root
+        ));
+        assert!(!is_modal_popup_relation(
+            root, popup, false, true, true, true, popup
+        ));
+        assert!(!is_modal_popup_relation(
+            root, root, false, true, true, true, root
+        ));
+    }
 }

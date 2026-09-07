@@ -1,9 +1,13 @@
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct HandleWrapper {
     handle: HANDLE,
 }
+
+// Owned kernel handles are process-wide values. Moving ownership to another
+// thread is safe as long as the wrapper remains the sole owner and closes it once.
+unsafe impl Send for HandleWrapper {}
 
 impl HandleWrapper {
     pub fn new(handle: HANDLE) -> Self {

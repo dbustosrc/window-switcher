@@ -34,6 +34,8 @@ use windows::{
 use xml::reader::XmlEvent;
 use xml::EventReader;
 
+const ICON_MESSAGE_TIMEOUT_MS: u32 = 40;
+
 pub fn get_app_icon(
     override_icons: &IndexMap<String, String>,
     module_path: &str,
@@ -188,6 +190,23 @@ fn fallback_icon() -> HICON {
     unsafe { CopyIcon(icon) }.unwrap_or_default()
 }
 
+pub fn get_quick_app_icon(hwnd: HWND) -> HICON {
+    get_class_icon(hwnd).unwrap_or_else(fallback_icon)
+}
+
+fn get_class_icon(hwnd: HWND) -> Option<HICON> {
+    #[cfg(target_arch = "x86")]
+    let icon = unsafe { windows::Win32::UI::WindowsAndMessaging::GetClassLongW(hwnd, GCLP_HICON) };
+    #[cfg(not(target_arch = "x86"))]
+    let icon =
+        unsafe { windows::Win32::UI::WindowsAndMessaging::GetClassLongPtrW(hwnd, GCLP_HICON) };
+    if icon == 0 {
+        None
+    } else {
+        unsafe { CopyIcon(HICON(icon as _)) }.ok()
+    }
+}
+
 pub fn get_window_icon(hwnd: HWND) -> Option<HICON> {
     let mut result: usize = 0;
     let ret = unsafe {
@@ -197,20 +216,15 @@ pub fn get_window_icon(hwnd: HWND) -> Option<HICON> {
             WPARAM(ICON_BIG as _),
             LPARAM(0),
             SMTO_ABORTIFHUNG,
-            250,
+            ICON_MESSAGE_TIMEOUT_MS,
             Some(&mut result),
         )
     };
     if ret.0 != 0 && result != 0 {
         return unsafe { CopyIcon(HICON(result as _)) }.ok();
     }
-    #[cfg(target_arch = "x86")]
-    let ret = unsafe { windows::Win32::UI::WindowsAndMessaging::GetClassLongW(hwnd, GCLP_HICON) };
-    #[cfg(not(target_arch = "x86"))]
-    let ret =
-        unsafe { windows::Win32::UI::WindowsAndMessaging::GetClassLongPtrW(hwnd, GCLP_HICON) };
-    if ret != 0 {
-        return unsafe { CopyIcon(HICON(ret as _)) }.ok();
+    if let Some(icon) = get_class_icon(hwnd) {
+        return Some(icon);
     }
     let ret = unsafe {
         SendMessageTimeoutW(
@@ -219,7 +233,7 @@ pub fn get_window_icon(hwnd: HWND) -> Option<HICON> {
             WPARAM(ICON_SMALL2 as _),
             LPARAM(0),
             SMTO_ABORTIFHUNG,
-            250,
+            ICON_MESSAGE_TIMEOUT_MS,
             Some(&mut result),
         )
     };
@@ -312,7 +326,7 @@ fn get_shfileinfo(module_path: &str) -> Option<SHFILEINFOW> {
         // Retry up to 3 times because SHGetFileInfoW can transiently fail
         // (e.g. shell not fully initialized, file system contention). A simple
         // short sleep + retry handles these spurious failures robustly.
-        for _ in 0..3 {
+        for attempt in 0..3 {
             let fff: usize = SHGetFileInfoW(
                 PCWSTR::from_raw(p_path.as_mut_ptr()),
                 FILE_ATTRIBUTE_NORMAL,
@@ -322,7 +336,7 @@ fn get_shfileinfo(module_path: &str) -> Option<SHFILEINFOW> {
             );
             if fff != 0 {
                 return Some(file_info);
-            } else {
+            } else if attempt < 2 {
                 let millis = time::Duration::from_millis(30);
                 std::thread::sleep(millis);
             }

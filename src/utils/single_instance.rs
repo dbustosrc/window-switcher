@@ -12,9 +12,6 @@ pub struct SingleInstance {
     handle: Option<HANDLE>,
 }
 
-unsafe impl Send for SingleInstance {}
-unsafe impl Sync for SingleInstance {}
-
 impl SingleInstance {
     /// Returns a new SingleInstance object.
     pub fn create(name: &str) -> Result<Self> {

@@ -1,7 +1,6 @@
 use windows::core::Error;
 use windows::Win32::Foundation::{SetLastError, ERROR_SUCCESS};
 
-#[allow(unused)]
 #[inline]
 /// Use to wrap fallible Win32 functions.
 /// First calls SetLastError(0).

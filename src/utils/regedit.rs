@@ -4,7 +4,7 @@ use windows::Win32::{
     Foundation::ERROR_FILE_NOT_FOUND,
     System::Registry::{
         RegCloseKey, RegDeleteValueW, RegGetValueW, RegOpenKeyExW, RegSetValueExW, HKEY,
-        HKEY_CURRENT_USER, KEY_ALL_ACCESS, REG_DWORD_BIG_ENDIAN, REG_SZ, REG_VALUE_TYPE,
+        HKEY_CURRENT_USER, KEY_ALL_ACCESS, KEY_READ, REG_DWORD_BIG_ENDIAN, REG_SZ, REG_VALUE_TYPE,
         RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
     },
 };
@@ -17,18 +17,22 @@ pub struct RegKey {
 
 impl RegKey {
     pub fn new_hkcu(subkey: PCWSTR, name: PCWSTR) -> Result<RegKey> {
+        Self::new_hkcu_with_access(subkey, name, KEY_ALL_ACCESS)
+    }
+
+    pub fn new_hkcu_read(subkey: PCWSTR, name: PCWSTR) -> Result<RegKey> {
+        Self::new_hkcu_with_access(subkey, name, KEY_READ)
+    }
+
+    fn new_hkcu_with_access(
+        subkey: PCWSTR,
+        name: PCWSTR,
+        access: windows::Win32::System::Registry::REG_SAM_FLAGS,
+    ) -> Result<RegKey> {
         let mut hkey = HKEY::default();
-        unsafe {
-            RegOpenKeyExW(
-                HKEY_CURRENT_USER,
-                subkey,
-                None,
-                KEY_ALL_ACCESS,
-                &mut hkey as *mut _,
-            )
-        }
-        .ok()
-        .map_err(|err| anyhow!("Fail to open reg key, {:?}", err))?;
+        unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey, None, access, &mut hkey as *mut _) }
+            .ok()
+            .map_err(|err| anyhow!("Fail to open reg key, {:?}", err))?;
         Ok(RegKey { hkey, name })
     }
 

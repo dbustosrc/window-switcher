@@ -10,9 +10,10 @@ use windows::Win32::{
             NOTIFYICONDATAW,
         },
         WindowsAndMessaging::{
-            AppendMenuW, CreateIconFromResourceEx, CreatePopupMenu, GetCursorPos,
-            LookupIconIdFromDirectoryEx, SetForegroundWindow, TrackPopupMenu, HMENU,
-            LR_DEFAULTCOLOR, MF_CHECKED, MF_STRING, MF_UNCHECKED, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
+            AppendMenuW, CreateIconFromResourceEx, CreatePopupMenu, DestroyIcon, DestroyMenu,
+            GetCursorPos, LookupIconIdFromDirectoryEx, SetForegroundWindow, TrackPopupMenu, HICON,
+            HMENU, LR_DEFAULTCOLOR, MF_CHECKED, MF_STRING, MF_UNCHECKED, TPM_BOTTOMALIGN,
+            TPM_LEFTALIGN,
         },
     },
 };
@@ -24,12 +25,13 @@ const TEXT_EXIT: PCWSTR = w!("Exit");
 
 pub struct TrayIcon {
     data: NOTIFYICONDATAW,
+    icon: HICON,
 }
 
 impl TrayIcon {
     pub fn create() -> Self {
-        let data = Self::create_nid();
-        Self { data }
+        let (data, icon) = Self::create_nid();
+        Self { data, icon }
     }
 
     pub fn register(&mut self, hwnd: HWND) -> Result<()> {
@@ -54,7 +56,7 @@ impl TrayIcon {
             let hmenu = self
                 .create_menu(startup)
                 .map_err(|e| anyhow!("Fail to create menu, {}", e))?;
-            TrackPopupMenu(
+            let result = TrackPopupMenu(
                 hmenu,
                 TPM_LEFTALIGN | TPM_BOTTOMALIGN,
                 cursor.x,
@@ -64,12 +66,14 @@ impl TrayIcon {
                 None,
             )
             .ok()
-            .map_err(|e| anyhow!("Fail to show popup menu, {}", e))?
+            .map_err(|e| anyhow!("Fail to show popup menu, {}", e));
+            let _ = DestroyMenu(hmenu);
+            result?;
         };
         Ok(())
     }
 
-    fn create_nid() -> NOTIFYICONDATAW {
+    fn create_nid() -> (NOTIFYICONDATAW, HICON) {
         let offset = unsafe {
             LookupIconIdFromDirectoryEx(ICON_BYTES.as_ptr(), true, 0, 0, LR_DEFAULTCOLOR)
         };
@@ -82,14 +86,15 @@ impl TrayIcon {
         tooltip.pop();
         tooltip.push(0);
         let tooltip: [u16; 128] = tooltip.try_into().unwrap();
-        NOTIFYICONDATAW {
+        let data = NOTIFYICONDATAW {
             uID: WM_USER_TRAYICON,
             uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
             uCallbackMessage: WM_USER_TRAYICON,
             hIcon: hicon,
             szTip: tooltip,
             ..Default::default()
-        }
+        };
+        (data, hicon)
     }
 
     fn create_menu(&mut self, startup: bool) -> Result<HMENU> {
@@ -109,6 +114,7 @@ impl Drop for TrayIcon {
         debug!("trayicon destroyed");
         unsafe {
             let _ = Shell_NotifyIconW(NIM_DELETE, &self.data);
+            let _ = DestroyIcon(self.icon);
         }
     }
 }
