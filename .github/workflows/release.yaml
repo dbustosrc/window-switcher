@@ -12,21 +12,20 @@ jobs:
     name: All
 
     strategy:
+      fail-fast: false
       matrix:
-        target:
-        - x86_64-pc-windows-msvc
         include:
         - target: x86_64-pc-windows-msvc
           os: windows-latest
           platform: windows-64
+        - target: i686-pc-windows-msvc
+          os: windows-latest
+          platform: windows-32
         - target: aarch64-pc-windows-msvc
           os: windows-latest
           platform: windows-arm64
-          use-cross: true
 
     runs-on: ${{matrix.os}}
-    env:
-      BUILD_CMD: cargo
 
     steps:
     - uses: actions/checkout@v6
@@ -49,17 +48,6 @@ jobs:
       with:
         targets: ${{ matrix.target }}
 
-    - name: Install cross
-      if: matrix.use-cross
-      uses: taiki-e/install-action@v2
-      with:
-        tool: cross
-  
-    - name: Overwrite build command env variable
-      if: matrix.use-cross
-      shell: bash
-      run: echo "BUILD_CMD=cross" >> $GITHUB_ENV
-
     - name: Show Version Information (Rust, cargo, GCC)
       shell: bash
       run: |
@@ -72,7 +60,7 @@ jobs:
       
     - name: Build
       shell: bash
-      run: $BUILD_CMD build --locked --release --target=${{ matrix.target }} ${{ matrix.cargo-flags }}
+      run: cargo build --locked --release --target=${{ matrix.target }}
 
     - name: Build Archive
       shell: bash
@@ -94,17 +82,21 @@ jobs:
         fi
 
         mkdir $dist_dir
-        cp $executable $dist_dir
+        cp $executable window-switcher.ini README.md LICENSE $dist_dir
         cd $dist_dir
 
         if [[ "$RUNNER_OS" == "Windows" ]]; then
-            archive=$dist_dir/$name.zip
-            7z a $archive *
-            echo "archive=dist/$name.zip" >> $GITHUB_OUTPUT
+            archive=$name.zip
+            7z a $archive window-switcher.exe window-switcher.ini README.md LICENSE
+            sha256sum $archive > $archive.sha256
+            echo "archive=dist/$archive" >> $GITHUB_OUTPUT
+            echo "checksum=dist/$archive.sha256" >> $GITHUB_OUTPUT
         else
-            archive=$dist_dir/$name.tar.gz
+            archive=$name.tar.gz
             tar -czf $archive *
-            echo "archive=dist/$name.tar.gz" >> $GITHUB_OUTPUT
+            sha256sum $archive > $archive.sha256
+            echo "archive=dist/$archive" >> $GITHUB_OUTPUT
+            echo "checksum=dist/$archive.sha256" >> $GITHUB_OUTPUT
         fi
 
     - name: Publish Archive
@@ -112,5 +104,8 @@ jobs:
       if: ${{ startsWith(github.ref, 'refs/tags/') }}
       with:
         draft: false
-        files: ${{ steps.package.outputs.archive }}
+        body_path: CHANGELOG.md
+        files: |
+          ${{ steps.package.outputs.archive }}
+          ${{ steps.package.outputs.checksum }}
         prerelease: ${{ steps.check-tag.outputs.rc == 'true' }}

@@ -1,5 +1,5 @@
 $command = "window-switcher"
-$repo = "sigoden/$command"
+$repo = "dbustosrc/$command"
 $url = "https://github.com/$repo"
 
 if ($env:OS -like "Windows*") {
@@ -29,6 +29,7 @@ $dest = "C:\Users\$env:USERNAME\AppData\Local\Programs\$command"
 $archive = "$url/releases/download/$tag/$command-$tag-$target.zip"
 
 $outfile = "$dest\$command.exe"
+$configfile = "$dest\$command.ini"
 
 Write-Host "Repository:  $url"
 Write-Host "Command:     $command"
@@ -71,6 +72,9 @@ if (Test-Path $outfile) {
 }
 
 Move-Item "$temp\$command.exe" $outfile
+if (-not (Test-Path $configfile)) {
+    Move-Item "$temp\$command.ini" $configfile
+}
 
 Remove-Item -Force "$temp.zip"
 Remove-Item -Force -Recurse "$temp"

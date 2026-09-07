@@ -490,7 +490,7 @@ fn get_icon_bounds(hicon: HICON) -> Option<IconBounds> {
 
         for (y, row) in rows.clone().enumerate() {
             let mut row_has_visible = false;
-            for c in row.chunks_exact(4) {
+            for c in row.as_chunks::<4>().0 {
                 let a = c[3];
                 if a != 0 {
                     row_has_visible = true;
@@ -509,7 +509,7 @@ fn get_icon_bounds(hicon: HICON) -> Option<IconBounds> {
             for (y, row) in rows.clone().rev().enumerate() {
                 let actual_y = (height as usize - 1) - y;
                 let mut row_has_visible = false;
-                for c in row.chunks_exact(4) {
+                for c in row.as_chunks::<4>().0 {
                     let a = c[3];
                     if a != 0 {
                         row_has_visible = true;
@@ -568,7 +568,9 @@ fn get_icon_bounds(hicon: HICON) -> Option<IconBounds> {
 
                 for (y, row) in mask_rows.clone().enumerate() {
                     if row
-                        .chunks_exact(4)
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
                         .any(|c| c[0] == 0 && c[1] == 0 && c[2] == 0)
                     {
                         min_y = y as i32;
@@ -580,7 +582,9 @@ fn get_icon_bounds(hicon: HICON) -> Option<IconBounds> {
                     for (y, row) in mask_rows.clone().rev().enumerate() {
                         let actual_y = (height as usize - 1) - y;
                         if row
-                            .chunks_exact(4)
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
                             .any(|c| c[0] == 0 && c[1] == 0 && c[2] == 0)
                         {
                             max_y = actual_y as i32;

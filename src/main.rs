@@ -206,7 +206,7 @@ mod tests {
         append_diagnostic(&path, "test panic", "thread=test, message=diagnostic");
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("test panic"));
-        assert!(content.contains("version=1.19.0"));
+        assert!(content.contains(&format!("version={}", env!("CARGO_PKG_VERSION"))));
         assert!(content.contains("thread=test, message=diagnostic"));
         let _ = std::fs::remove_file(path);
     }

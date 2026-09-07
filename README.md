@@ -16,7 +16,25 @@ Hold `Alt` and press `Tab` or Backtick repeatedly to move through the available 
 
 ## Installation
 
-There is not yet a packaged release for this independent version. Build it from source using the Rust MSVC toolchain:
+Download the appropriate archive from the [latest release](https://github.com/dbustosrc/window-switcher/releases/latest):
+
+- `windows-64` for most Intel and AMD computers.
+- `windows-arm64` for Windows on ARM.
+- `windows-32` for 32-bit Windows installations.
+
+Extract the complete archive to a permanent directory and run `window-switcher.exe`. Keep `window-switcher.ini` beside the executable.
+
+Alternatively, install or update the 64-bit/32-bit/ARM64 version automatically with PowerShell:
+
+```powershell
+iwr -useb https://raw.githubusercontent.com/dbustosrc/window-switcher/main/install.ps1 | iex
+```
+
+The installer preserves an existing `window-switcher.ini` so updates do not overwrite personal settings.
+
+## Building from source
+
+Install the Rust MSVC toolchain and clone the repository:
 
 ```powershell
 git clone https://github.com/dbustosrc/window-switcher.git
@@ -24,16 +42,7 @@ cd window-switcher
 cargo build --release
 ```
 
-Copy both required runtime files to the same destination directory:
-
-```powershell
-$destination = "$env:LOCALAPPDATA\Programs\window-switcher"
-New-Item -ItemType Directory -Force -Path $destination
-Copy-Item .\target\release\window-switcher.exe $destination
-Copy-Item .\window-switcher.ini $destination
-```
-
-Run `window-switcher.exe` from that directory. The configuration file must remain beside the executable.
+Copy `target\release\window-switcher.exe` and `window-switcher.ini` to the same destination directory.
 
 ## Configuration
 
@@ -106,7 +115,7 @@ When enabled from an elevated instance, Window Switcher creates a Scheduled Task
 
 Disable an existing elevated startup task before enabling startup from a standard instance, avoiding two competing instances.
 
-## Building and testing
+## Testing
 
 ```powershell
 cargo build --release
