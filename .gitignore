@@ -1,3 +1,6 @@
 /target
 /.vscode
 *.log
+/window-switcher-running.marker
+/tasks.md
+/analysis-performance-*.md

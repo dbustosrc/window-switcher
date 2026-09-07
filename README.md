@@ -1,115 +1,153 @@
 # Window Switcher
 
-Window-Switcher offers hotkeys for quickly switching windows on Windows OS:
+Window Switcher is a lightweight, classic-style Alt+Tab replacement for Windows. It switches individual windows instead of grouping them by application and is designed for low latency and minimal resource usage.
 
-1. ```Alt+`(Backtick)```: switch between windows of the same app.
+## Features
 
-![switch-windows](https://github.com/sigoden/window-switcher/assets/4012553/06d387ce-31fd-450b-adf3-01bfcfc4bce3)
+- `Alt+Tab` cycles through every independent top-level window in Windows' global window order.
+- `Alt+\`` (Backtick) cycles through windows that belong to the same application.
+- The selected window title is displayed below the icon.
+- Independent documents or sessions remain separate entries, even when they belong to the same process. For example, two Excel workbooks or two SAP GUI sessions appear separately.
+- A blocking modal dialog and its disabled owner are represented by one entry. The selector displays the dialog title when available and activates the dialog when selected.
+- Minimized windows and windows on other virtual desktops can be included or excluded through configuration.
+- Elevated applications are supported when Window Switcher is also running as administrator.
 
-2. ```Alt+Tab```: switch between all windows, without grouping them by app. The selected window title is shown below the icons.
-
-![switch-apps](https://github.com/sigoden/window-switcher/assets/4012553/0c74a7ca-3a48-4458-8d2d-b40dc041f067)
-
-**💡 Hold down the `Alt` key and tap the ``` `(Backtick)/Tab ``` key to cycle through windows, Press ```Alt + `(Backtick)/Tab``` and release both keys to switch to the last active window.**
+Hold `Alt` and press `Tab` or Backtick repeatedly to move through the available windows. Release `Alt` to activate the selected window. Add `Shift` to cycle in reverse.
 
 ## Installation
 
-1. **Download:** Visit the [Github Release](https://github.com/sigoden/windows-switcher/releases) and download the `windows-switcher.zip` file.
-2. **Extract:** Unzip the downloaded file and extract the `window-switcher.exe` to your preferred location.
-3. **Launch:** `window-switcher.exe` is a standalone executable, no installation is required, just double-click the file to run it.
+There is not yet a packaged release for this independent version. Build it from source using the Rust MSVC toolchain:
 
-For the tech-savvy, here's a one-liner to automate the installation:
-```ps1
-iwr -useb https://raw.githubusercontent.com/sigoden/window-switcher/main/install.ps1 | iex
+```powershell
+git clone https://github.com/dbustosrc/window-switcher.git
+cd window-switcher
+cargo build --release
 ```
+
+Copy both required runtime files to the same destination directory:
+
+```powershell
+$destination = "$env:LOCALAPPDATA\Programs\window-switcher"
+New-Item -ItemType Directory -Force -Path $destination
+Copy-Item .\target\release\window-switcher.exe $destination
+Copy-Item .\window-switcher.ini $destination
+```
+
+Run `window-switcher.exe` from that directory. The configuration file must remain beside the executable.
 
 ## Configuration
 
-Window-Switcher offers various customization options to tailor its behavior to your preferences. You can define custom keyboard shortcuts, enable or disable specific features, and fine-tune settings through a configuration file.
-
-To personalize Window-Switcher, you'll need a configuration file named `window-switcher.ini`. This file should be placed in the same directory as the `window-switcher.exe` file. Once you've made changes to the configuration, make sure to restart Window-Switcher so your new settings can take effect.
-
-Here is the default configuration:
+Window Switcher reads `window-switcher.ini` from the executable directory. Restart the application after editing it. When the tray icon is enabled, its context menu provides a shortcut for opening the configuration file.
 
 ```ini
-# Whether to show trayicon, yes/no
-trayicon = yes 
+# Whether to show the tray icon: yes/no
+trayicon = yes
 
 [switch-windows]
 
-# Hotkey to switch windows
+# Switch between windows of the same application.
+# Multiple hotkeys can be separated with ||.
 hotkey = alt+`
 
-# List of hotkey conflict apps
-# e.g. game1.exe,game2.exe
+# Executables for which the same-application shortcut is disabled.
+# Example: game1.exe,game2.exe
 blacklist =
 
-# Ignore minimal windows
+# Exclude minimized windows: yes/no
 ignore_minimal = no
 
-# Only switch within the current virtual desktops: yes/no/auto
+# Restrict switching to the current virtual desktop: yes/no/auto
+# auto follows Windows' Alt+Tab virtual-desktop setting.
 only_current_desktop = auto
 
 [switch-apps]
 
-# Whether to enable switching all windows
+# Enable classic switching between all individual windows: yes/no
 enable = yes
 
-# Hotkey to switch all windows
+# Multiple hotkeys can be separated with ||.
 hotkey = alt+tab
 
-# Ignore minimal windows
+# Exclude minimized windows: yes/no
 ignore_minimal = no
 
-# Only switch windows within the current virtual desktops: yes/no/auto
+# Override application icons.
+# Syntax: app1.exe=icon1.ico,app2.exe=icon2.png
+# Paths can be absolute or relative to the executable directory.
+override_icons =
+
+# Restrict switching to the current virtual desktop: yes/no/auto
+# auto follows Windows' Alt+Tab virtual-desktop setting.
 only_current_desktop = auto
+
+[log]
+
+# One of: off, error, warn, info, debug, trace
+level = info
+
+# Relative paths are resolved from the executable directory.
+# Leave empty to disable the operational log.
+path = window-switcher.log
 ```
 
-## Running as Administrator (Optional)
+Boolean values also accept `true/false`, `on/off`, and `1/0`.
 
-The window-switcher works in standard user mode. But only the window-switcher running in administrator mode can manage applications running in administrator mode.
+## Running as administrator
 
-Windows does not allow a normal-integrity process to intercept keyboard input intended for an elevated window. As a result, when Task Manager or another elevated application is focused, Windows may show its native Alt+Tab selector unless Window-Switcher is also elevated. Supporting this without elevation would require a correctly signed executable installed in a trusted location with `uiAccess`; it cannot be enabled safely by an INI option alone.
+A standard-integrity process cannot intercept keyboard input intended for an elevated window. If Task Manager or another elevated application has focus, Windows may show its native Alt+Tab selector unless Window Switcher is also elevated.
 
-**Important:** If you enable the startup option while running in standard user mode, it will launch in standard mode upon system reboot. To ensure startup with admin privileges, launch the window-switcher as administrator first before enabling startup.
+To start Window Switcher automatically:
 
-When startup is enabled from an elevated Window-Switcher instance, the application uses a Windows Scheduled Task instead of the per-user `Run` registry key. This remains the supported fallback for starting with elevated privileges; it does not make a normal, manually launched instance elevated.
+1. Run it at the privilege level you want to use permanently.
+2. Right-click the tray icon.
+3. Enable **Startup**.
+
+When enabled from an elevated instance, Window Switcher creates a Scheduled Task with the highest available run level. The generated task is configured to continue running when the computer switches to battery power. A standard instance uses the current user's `Run` registry key instead.
+
+Disable an existing elevated startup task before enabling startup from a standard instance, avoiding two competing instances.
+
+## Building and testing
+
+```powershell
+cargo build --release
+cargo test --workspace
+```
+
+The optimized executable is written to `target\release\window-switcher.exe`.
 
 ## Performance diagnostics
 
-Normal release builds contain no timing overhead. To enable optional timing for window enumeration, icon resolution and painting, build with:
+Release builds contain no performance-timing instrumentation by default. Enable optional measurements for window enumeration, icon resolution and painting with:
 
-```ps1
+```powershell
 cargo build --release --features perf
 ```
 
-Configure a log file in `window-switcher.ini` to collect the measurements. The inspection tool can also benchmark repeated enumeration and report p50/p95 latency:
+Set `[log] level = debug` and configure `[log] path` to collect those measurements. The inspection tool can benchmark repeated enumeration and report latency percentiles:
 
-```ps1
+```powershell
 cargo run --release -p inspect-windows -- --benchmark 100
 ```
 
-For an end-to-end benchmark, first close any running Window-Switcher instance. The benchmark launches the supplied executable, creates a stable test window, sends real Alt+Tab input, measures selector visibility and process resources, and closes only the instance it launched:
+For an end-to-end benchmark, first close any running Window Switcher instance. The benchmark launches the supplied executable, creates a test window, sends Alt+Tab input and closes only the instance it launched:
 
-```ps1
+```powershell
 cargo build --release -p benchmark-switcher
 cargo run --release -p benchmark-switcher -- .\target\release\window-switcher.exe 500 3
 ```
 
-The last two arguments are the number of measured open/close cycles and the number of additional Tab presses while Alt remains held.
+The last two arguments are the number of measured open/close cycles and the number of additional `Tab` presses while `Alt` remains held.
 
-## Runtime and crash logs
+## Logs and crash diagnostics
 
-The default configuration writes operational events to `window-switcher.log` beside the executable. Set `[log] level` to `debug` temporarily when investigating behavior; `info` is recommended for normal use.
+When `[log] path` is configured, operational events are appended to that file. `info` is recommended for normal use; use `debug` temporarily when investigating behavior.
 
-Fatal startup/runtime errors and Rust panics are also appended to `window-switcher-crash.log` beside the executable, including the version, process ID, thread, source location and a backtrace. This crash log is independent of the INI logger, so configuration and logging initialization failures can still be diagnosed.
+Fatal runtime errors and Rust panics are appended to `window-switcher-crash.log` beside the executable. The report includes the version, process ID, thread, source location and a backtrace, and does not depend on the regular INI logger.
 
-While the application is running it maintains `window-switcher-running.marker`. A normal shutdown removes it. If the next launch finds the marker, it records an `unclean previous shutdown` entry in the crash log; this also detects forced or native terminations that cannot execute the Rust panic hook.
+While running, the application maintains `window-switcher-running.marker` beside the executable. A normal shutdown removes it. If the next launch finds the marker, it records an unclean previous shutdown in the crash log.
 
-## License
+## Project history and license
 
-Copyright (c) 2023-2025 window-switcher developers.
+This project is derived from [sigoden/window-switcher](https://github.com/sigoden/window-switcher) and includes substantial changes to window enumeration, switching behavior, rendering, diagnostics and resource management.
 
-window-switcher is made available under the terms of the MIT License, at your option.
-
-See the LICENSE files for license details.
+Window Switcher is distributed under the MIT License. See [LICENSE](LICENSE) for the original copyright notice and license terms.
